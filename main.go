@@ -1,17 +1,14 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"log"
 	"math/big"
 	"os"
 
-	"github.com/ethereum/go-ethereum/accounts/abi/bind"
-	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/ethclient"
+	"github.com/ethereum/go-ethereum/crypto"
 	config "github.com/yieldchain/presale-oracle/config"
-	presale "github.com/yieldchain/presale-oracle/contracts"
+	"github.com/yieldchain/presale-oracle/oracle"
 )
 
 func main() {
@@ -25,13 +22,10 @@ func main() {
 	config.Load(args[0])
 	fmt.Println(config)
 
-	fmt.Println("Testing")
-	client, err := ethclient.Dial(config.Networks[0].Rpc)
+	privateKey, err := crypto.HexToECDSA(config.PrivateKey)
 	if err != nil {
 		log.Fatal(err)
 	}
-
-	ctx := context.Background()
 
 	chainChannels := make([]chan *big.Int, len(config.Networks))
 	for i, _ := range config.Networks {
@@ -39,61 +33,43 @@ func main() {
 	}
 	total := big.NewInt(0)
 
+	oracles := make([]*oracle.Oracle, len(config.Networks))
+
 	for i, network := range config.Networks {
-		go func() {
-			contractAddress := common.HexToAddress(network.Contract)
-			contract, err := presale.NewPresale(contractAddress, client)
-			if err != nil {
-				log.Fatal(err)
-			}
+		o := oracle.NewOracle(network.Rpc, network.Contract, big.NewInt(int64(network.ChainId)), chainChannels[i], privateKey)
+		oracles[i] = o
 
-			var start uint64 = 18209890
-			watchOpts := &bind.WatchOpts{Context: ctx, Start: &start}
-
-			callOpts := &bind.CallOpts{Context: ctx}
-
-			channel := make(chan *presale.PresaleContribution)
-			chainTotal, err := contract.Contributed(callOpts)
-			if err != nil {
-				log.Fatal(err)
-			}
-
-			chainChannels[i] <- chainTotal
-
-			sub, err := contract.WatchContribution(watchOpts, channel, nil, nil)
-			if err != nil {
-				log.Fatal(err)
-			}
-			fmt.Println("Subscribed")
-			defer sub.Unsubscribe()
-
-			for {
-				select {
-				case event := <-channel:
-					fmt.Println("Account ", event.Buyer, " contributed ", event.Amount, " in ", event.Token)
-					chainChannels[i] <- event.Amount
-				case err := <-sub.Err():
-					log.Fatal(err)
-				}
-			}
-
-		}()
+		o.Connect()
+		go o.Listen()
 	}
 
 	aggregate := make(chan *big.Int)
-	for _, ch := range chainChannels {
-		go func(c chan *big.Int) {
+	network := make(chan int)
+	for i, ch := range chainChannels {
+		go func(c chan *big.Int, net int) {
 			for msg := range c {
 				aggregate <- msg
+				network <- net
 			}
-		}(ch)
+		}(ch, i)
 	}
 
 	for {
 		select {
 		case newContrib := <-aggregate:
 			total = total.Add(total, newContrib)
+			x := <-network
+			fmt.Println("Adding ", newContrib, " from oracle ", x)
 			fmt.Println("Total: ", total)
+			y := big.NewInt(760000000000)
+			yMul := big.NewInt(10000000000)
+			y = y.Mul(y, yMul)
+			if total.Cmp(y) > 0 {
+				for _, oracle := range oracles {
+					oracle.Stop()
+				}
+			}
+
 		}
 	}
 
