@@ -33,53 +33,67 @@ func main() {
 
 	ctx := context.Background()
 
-	contributed := make(chan *big.Int)
+	chainChannels := make([]chan *big.Int, len(config.Networks))
+	for i, _ := range config.Networks {
+		chainChannels[i] = make(chan *big.Int)
+	}
 	total := big.NewInt(0)
 
-	go func() {
-		contractAddress := common.HexToAddress(config.Networks[0].Contract)
-		contract, err := presale.NewPresale(contractAddress, client)
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		var start uint64 = 18209890
-		watchOpts := &bind.WatchOpts{Context: ctx, Start: &start}
-
-		callOpts := &bind.CallOpts{Context: ctx}
-
-		channel := make(chan *presale.PresaleContribution)
-		chainTotal, err := contract.Contributed(callOpts)
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		contributed <- chainTotal
-
-		sub, err := contract.WatchContribution(watchOpts, channel, nil, nil)
-		if err != nil {
-			log.Fatal(err)
-		}
-		fmt.Println("Subscribed")
-		defer sub.Unsubscribe()
-
-		for {
-			select {
-			case event := <-channel:
-				fmt.Println("Account ", event.Buyer, " contributed ", event.Amount, " in ", event.Token)
-				contributed <- event.Amount
-			case err := <-sub.Err():
+	for i, network := range config.Networks {
+		go func() {
+			contractAddress := common.HexToAddress(network.Contract)
+			contract, err := presale.NewPresale(contractAddress, client)
+			if err != nil {
 				log.Fatal(err)
 			}
-		}
 
-	}()
+			var start uint64 = 18209890
+			watchOpts := &bind.WatchOpts{Context: ctx, Start: &start}
+
+			callOpts := &bind.CallOpts{Context: ctx}
+
+			channel := make(chan *presale.PresaleContribution)
+			chainTotal, err := contract.Contributed(callOpts)
+			if err != nil {
+				log.Fatal(err)
+			}
+
+			chainChannels[i] <- chainTotal
+
+			sub, err := contract.WatchContribution(watchOpts, channel, nil, nil)
+			if err != nil {
+				log.Fatal(err)
+			}
+			fmt.Println("Subscribed")
+			defer sub.Unsubscribe()
+
+			for {
+				select {
+				case event := <-channel:
+					fmt.Println("Account ", event.Buyer, " contributed ", event.Amount, " in ", event.Token)
+					chainChannels[i] <- event.Amount
+				case err := <-sub.Err():
+					log.Fatal(err)
+				}
+			}
+
+		}()
+	}
+
+	aggregate := make(chan *big.Int)
+	for _, ch := range chainChannels {
+		go func(c chan *big.Int) {
+			for msg := range c {
+				aggregate <- msg
+			}
+		}(ch)
+	}
 
 	for {
 		select {
-		case newContrib := <-contributed:
+		case newContrib := <-aggregate:
 			total = total.Add(total, newContrib)
-			fmt.Println(total)
+			fmt.Println("Total: ", total)
 		}
 	}
 
