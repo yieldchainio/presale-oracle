@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"math/big"
+	"time"
 
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
@@ -14,62 +15,81 @@ import (
 )
 
 type Oracle struct {
-	rpc         string
-	address     common.Address
-	client      *ethclient.Client
-	contract    *presale.Presale
-	contributed *big.Int
-	channel     chan *big.Int
-	auth        *bind.TransactOpts
+	rpc          string
+	Name         string
+	address      common.Address
+	client       *ethclient.Client
+	contract     *presale.Presale
+	contributed  *big.Int
+	channel      chan *big.Int
+	errorChannel chan bool
+	auth         *bind.TransactOpts
+	Total        *big.Int
+	HardCap      *big.Int
 }
 
-func NewOracle(rpc string, contract string, chainId *big.Int, channel chan *big.Int, privateKey *ecdsa.PrivateKey) *Oracle {
+func NewOracle(rpc string, contract string, chainId *big.Int, chainName string, channel chan *big.Int, errorChannel chan bool, privateKey *ecdsa.PrivateKey) *Oracle {
 
 	auth, err := bind.NewKeyedTransactorWithChainID(privateKey, chainId)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal(chainName, ": ", err)
 	}
 
 	contractAddress := common.HexToAddress(contract)
-	oracle := Oracle{rpc: rpc, address: contractAddress, channel: channel, auth: auth}
+	oracle := Oracle{rpc: rpc, address: contractAddress, channel: channel, errorChannel: errorChannel, auth: auth, Name: chainName, Total: big.NewInt(0)}
 
 	return &oracle
 }
 
 func (o *Oracle) Connect() {
-	log.Println(o.rpc)
 	client, err := ethclient.Dial(o.rpc)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal("Error on ", o.Name, ": ", err)
 	}
 
 	o.client = client
 
 	ctr, err := presale.NewPresale(o.address, client)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal("Error on ", o.Name, ": ", err)
 	}
 	o.contract = ctr
 
 }
 
 func (o *Oracle) Listen() {
+	log.Println("Starting ", o.Name, "listener...")
+
 	ctx := context.Background()
-	watchOpts := &bind.WatchOpts{Context: ctx, Start: nil}
+
+	var start uint64
+	header, err := o.client.HeaderByNumber(ctx, nil)
+	if err != nil {
+		log.Println(o.Name, ": ", err)
+	} else {
+		start = header.Number.Uint64()
+	}
+
+	watchOpts := &bind.WatchOpts{Context: ctx, Start: &start}
 
 	callOpts := &bind.CallOpts{Context: ctx}
 
 	channel := make(chan *presale.PresaleContribution)
 	chainTotal, err := o.contract.Contributed(callOpts)
 	if err != nil {
-		log.Fatal(err)
+		log.Println("Error on ", o.Name, ": ", err)
+		o.errorChannel <- true
+		return
 	}
 
+	o.Total = o.Total.Add(o.Total, chainTotal)
 	o.channel <- chainTotal
 
 	sub, err := o.contract.WatchContribution(watchOpts, channel, nil, nil)
 	if err != nil {
-		log.Fatal(err)
+		log.Println("Error on ", o.Name, ": ", err)
+		o.errorChannel <- true
+		return
 	}
 	defer sub.Unsubscribe()
 
@@ -77,46 +97,94 @@ func (o *Oracle) Listen() {
 		select {
 		case event := <-channel:
 			fmt.Println("Account ", event.Buyer, " contributed ", event.Amount, " in ", event.Token)
+			o.Total = o.Total.Add(o.Total, event.Amount)
 			o.channel <- event.Amount
 		case err := <-sub.Err():
-			log.Fatal(err)
+			log.Printf("Error in %s: %v", o.Name, err)
+			o.errorChannel <- (err != nil)
+			log.Println("Error sent")
+			o.Total.SetUint64(0)
+			return
 		}
 	}
 }
 
 func (o *Oracle) Stop() {
 	ctx := context.Background()
-	chainId, err := o.client.ChainID(ctx)
-	if err != nil {
-		log.Fatal(err)
-	}
-	nonce, err := o.client.PendingNonceAt(context.Background(), o.auth.From)
-	if err != nil {
-		log.Fatal(err)
-	}
 
-	o.auth.Nonce = big.NewInt(int64(nonce))
+	for i := 0; i < 10; i++ {
+		nonce, err := o.client.PendingNonceAt(context.Background(), o.auth.From)
+		if err != nil {
+			log.Println(err)
+			continue
+		}
 
-	/*gasPrice, err := o.client.SuggestGasPrice(context.Background())
-	if err != nil {
-		log.Fatal(err)
+		o.auth.Nonce = big.NewInt(int64(nonce))
+
+		gasPrice, err := o.client.SuggestGasPrice(context.Background())
+		if err != nil {
+			log.Println(err)
+			continue
+		}
+
+		o.auth.GasPrice = gasPrice.Mul(gasPrice, big.NewInt(int64(i+2)))
+
+		callOpts := &bind.CallOpts{Context: ctx}
+		isOpen, err := o.contract.IsOpen(callOpts)
+		if err != nil {
+			log.Println(err)
+			continue
+		}
+
+		if isOpen {
+			tx, err := o.contract.SetSaleOpen(o.auth, false)
+			if err != nil {
+				log.Printf("Failed to stop presale at %s (%s), nonce %d: %v", o.Name, o.address.String(), nonce, err)
+				log.Println("Retry to stop ", o.Name)
+				continue
+			}
+			log.Println("Stopping contributions in TX ", tx.Hash().Hex())
+			success := false
+			time.Sleep(10 * time.Second)
+			for j := 0; j < 6; j++ {
+				receipt, err := o.client.TransactionReceipt(ctx, common.BytesToHash([]byte("0x8dbca7f86c08278f0a7702114a3fc4e90830be0576f05950dc11a2af10457933"))) //tx.Hash())
+				if err != nil {
+					log.Println("TX ", tx.Hash(), ": ", err)
+					continue
+				} else if receipt.Status == 1 {
+					success = true
+					break
+				}
+				time.Sleep(5 * time.Second)
+			}
+			if success {
+				isOpen, err := o.contract.IsOpen(callOpts)
+				if err != nil {
+					log.Println(err)
+					continue
+				}
+				log.Println("Status of ", o.Name, ": ", isOpen)
+				break
+			}
+		} else {
+			log.Printf("Already closed on %s (%s)", o.Name, o.address)
+			break
+		}
+
 	}
+}
 
-	o.auth.GasPrice = gasPrice*/
+func (o *Oracle) GetHardcap() {
+	ctx := context.Background()
 
 	callOpts := &bind.CallOpts{Context: ctx}
-	isOpen, err := o.contract.IsOpen(callOpts)
+	hardCap, err := o.contract.HARDCAP(callOpts)
 	if err != nil {
-		log.Fatal(err)
+		log.Println("Error on ", o.Name, ": ", err)
+		o.errorChannel <- true
+		return
 	}
 
-	if isOpen {
-		tx, err := o.contract.SetSaleOpen(o.auth, false)
-		if err != nil {
-			log.Fatalf("Failed to stop presale at %d (%s): %v", chainId.Int64(), o.address.String(), err)
-		}
-		log.Println("Stopping contributions in TX ", tx.Hash())
-	} else {
-		log.Printf("Already closed on %d (%s)", chainId.Int64(), o.address)
-	}
+	o.HardCap = hardCap
+
 }

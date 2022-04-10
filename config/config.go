@@ -17,6 +17,7 @@ type Network struct {
 	Rpc      string `json:"rpc"`
 	Contract string `json:"contract"`
 	ChainId  uint   `json:"chainId"`
+	Name     string `json:"name"`
 }
 
 func NewConfig() *Config {

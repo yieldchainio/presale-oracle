@@ -5,6 +5,7 @@ import (
 	"log"
 	"math/big"
 	"os"
+	"time"
 
 	"github.com/ethereum/go-ethereum/crypto"
 	config "github.com/yieldchain/presale-oracle/config"
@@ -28,19 +29,17 @@ func main() {
 	}
 
 	chainChannels := make([]chan *big.Int, len(config.Networks))
-	for i, _ := range config.Networks {
-		chainChannels[i] = make(chan *big.Int)
-	}
-	total := big.NewInt(0)
-
+	errorChannels := make([]chan bool, len(config.Networks))
 	oracles := make([]*oracle.Oracle, len(config.Networks))
-
 	for i, network := range config.Networks {
-		o := oracle.NewOracle(network.Rpc, network.Contract, big.NewInt(int64(network.ChainId)), chainChannels[i], privateKey)
+		chainChannels[i] = make(chan *big.Int)
+		errorChannels[i] = make(chan bool)
+		o := oracle.NewOracle(network.Rpc, network.Contract, big.NewInt(int64(network.ChainId)), network.Name, chainChannels[i], errorChannels[i], privateKey)
 		oracles[i] = o
 
 		o.Connect()
 		go o.Listen()
+		go o.GetHardcap()
 	}
 
 	aggregate := make(chan *big.Int)
@@ -54,22 +53,42 @@ func main() {
 		}(ch, i)
 	}
 
+	errorAgg := make(chan bool)
+	errorNet := make(chan int)
+	for i, ch := range errorChannels {
+		go func(c chan bool, net int) {
+			for msg := range c {
+				errorAgg <- msg
+				errorNet <- net
+			}
+		}(ch, i)
+	}
+
 	for {
 		select {
 		case newContrib := <-aggregate:
-			total = total.Add(total, newContrib)
-			x := <-network
-			fmt.Println("Adding ", newContrib, " from oracle ", x)
-			fmt.Println("Total: ", total)
-			y := big.NewInt(760000000000)
-			yMul := big.NewInt(10000000000)
-			y = y.Mul(y, yMul)
-			if total.Cmp(y) > 0 {
-				for _, oracle := range oracles {
-					oracle.Stop()
-				}
+			total := big.NewInt(0)
+			for _, oracle := range oracles {
+				fmt.Println(oracle.Name, " = ", oracle.Total)
+				total = total.Add(total, oracle.Total)
 			}
 
+			x := <-network
+			fmt.Println("Adding ", newContrib, " from oracle ", oracles[x].Name)
+			fmt.Println("Total: ", total)
+			hardCap := oracles[x].HardCap //big.NewInt(100000000000000) //oracles[x].HardCap
+			fmt.Println("HardCap on ", oracles[x].Name, ": ", total, "/", hardCap)
+			if total.Cmp(hardCap) > 0 {
+				for _, oracle := range oracles {
+					go oracle.Stop()
+				}
+			}
+		case listenerError := <-errorAgg:
+			log.Println("Error handling ", listenerError)
+			id := <-errorNet
+			time.Sleep(1 * time.Second)
+			log.Println("Listener ", oracles[id].Name, " failed, restarting")
+			go oracles[id].Listen()
 		}
 	}
 
