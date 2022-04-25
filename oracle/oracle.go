@@ -15,28 +15,34 @@ import (
 )
 
 type Oracle struct {
-	rpc          string
-	Name         string
-	address      common.Address
-	client       *ethclient.Client
-	contract     *presale.Presale
-	contributed  *big.Int
-	channel      chan *big.Int
-	errorChannel chan bool
-	auth         *bind.TransactOpts
-	Total        *big.Int
-	HardCap      *big.Int
+	rpc          string             //RPC URL
+	Name         string             //Chain name
+	address      common.Address     //Contract address
+	client       *ethclient.Client  //eth client
+	contract     *presale.Presale   //Contract instance
+	contributed  *big.Int           //Contributed via the contract
+	cContributed chan *big.Int      //Channel to report new contribution to
+	cError       chan bool          //Channel to report error to
+	auth         *bind.TransactOpts //Transaction options
+	Total        *big.Int           //Total contributed
+	HardCap      *big.Int           //Hard cap for contribution
 }
 
-func NewOracle(rpc string, contract string, chainId *big.Int, chainName string, channel chan *big.Int, errorChannel chan bool, privateKey *ecdsa.PrivateKey) *Oracle {
-
+func NewOracle(rpc string, contract string, chainId *big.Int, chainName string, cContributed chan *big.Int, errorChannel chan bool, privateKey *ecdsa.PrivateKey) *Oracle {
 	auth, err := bind.NewKeyedTransactorWithChainID(privateKey, chainId)
 	if err != nil {
 		log.Fatal(chainName, ": ", err)
 	}
 
 	contractAddress := common.HexToAddress(contract)
-	oracle := Oracle{rpc: rpc, address: contractAddress, channel: channel, errorChannel: errorChannel, auth: auth, Name: chainName, Total: big.NewInt(0)}
+	oracle := Oracle{
+		rpc:          rpc,
+		address:      contractAddress,
+		cContributed: cContributed,
+		cError:       errorChannel,
+		auth:         auth,
+		Name:         chainName,
+		Total:        big.NewInt(0)}
 
 	return &oracle
 }
@@ -78,17 +84,17 @@ func (o *Oracle) Listen() {
 	chainTotal, err := o.contract.Contributed(callOpts)
 	if err != nil {
 		log.Println("Error on ", o.Name, ": ", err)
-		o.errorChannel <- true
+		o.cError <- true
 		return
 	}
 
 	o.Total = o.Total.Add(o.Total, chainTotal)
-	o.channel <- chainTotal
+	o.cContributed <- chainTotal
 
 	sub, err := o.contract.WatchContribution(watchOpts, channel, nil, nil)
 	if err != nil {
 		log.Println("Error on ", o.Name, ": ", err)
-		o.errorChannel <- true
+		o.cError <- true
 		return
 	}
 	defer sub.Unsubscribe()
@@ -98,11 +104,10 @@ func (o *Oracle) Listen() {
 		case event := <-channel:
 			fmt.Println("Account ", event.Buyer, " contributed ", event.Amount, " in ", event.Token)
 			o.Total = o.Total.Add(o.Total, event.Amount)
-			o.channel <- event.Amount
+			o.cContributed <- event.Amount
 		case err := <-sub.Err():
 			log.Printf("Error in %s: %v", o.Name, err)
-			o.errorChannel <- (err != nil)
-			log.Println("Error sent")
+			o.cError <- (err != nil)
 			o.Total.SetUint64(0)
 			return
 		}
@@ -147,7 +152,7 @@ func (o *Oracle) Stop() {
 			success := false
 			time.Sleep(10 * time.Second)
 			for j := 0; j < 6; j++ {
-				receipt, err := o.client.TransactionReceipt(ctx, common.BytesToHash([]byte("0x8dbca7f86c08278f0a7702114a3fc4e90830be0576f05950dc11a2af10457933"))) //tx.Hash())
+				receipt, err := o.client.TransactionReceipt(ctx, tx.Hash())
 				if err != nil {
 					log.Println("TX ", tx.Hash(), ": ", err)
 					continue
@@ -181,7 +186,7 @@ func (o *Oracle) GetHardcap() {
 	hardCap, err := o.contract.HARDCAP(callOpts)
 	if err != nil {
 		log.Println("Error on ", o.Name, ": ", err)
-		o.errorChannel <- true
+		o.cError <- true
 		return
 	}
 
