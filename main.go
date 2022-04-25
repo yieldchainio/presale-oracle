@@ -28,13 +28,21 @@ func main() {
 		log.Fatal(err)
 	}
 
+	//Setup an oracle per configured network
 	chainChannels := make([]chan *big.Int, len(config.Networks))
 	errorChannels := make([]chan bool, len(config.Networks))
 	oracles := make([]*oracle.Oracle, len(config.Networks))
 	for i, network := range config.Networks {
 		chainChannels[i] = make(chan *big.Int)
 		errorChannels[i] = make(chan bool)
-		o := oracle.NewOracle(network.Rpc, network.Contract, big.NewInt(int64(network.ChainId)), network.Name, chainChannels[i], errorChannels[i], privateKey)
+		o := oracle.NewOracle(
+			network.Rpc,
+			network.Contract,
+			big.NewInt(int64(network.ChainId)),
+			network.Name, chainChannels[i],
+			errorChannels[i],
+			privateKey,
+		)
 		oracles[i] = o
 
 		o.Connect()
@@ -42,6 +50,7 @@ func main() {
 		go o.GetHardcap()
 	}
 
+	//Setup the  contribution channels
 	aggregate := make(chan *big.Int)
 	network := make(chan int)
 	for i, ch := range chainChannels {
@@ -53,6 +62,7 @@ func main() {
 		}(ch, i)
 	}
 
+	//Setup error channels
 	errorAgg := make(chan bool)
 	errorNet := make(chan int)
 	for i, ch := range errorChannels {
@@ -69,14 +79,13 @@ func main() {
 		case newContrib := <-aggregate:
 			total := big.NewInt(0)
 			for _, oracle := range oracles {
-				fmt.Println(oracle.Name, " = ", oracle.Total)
 				total = total.Add(total, oracle.Total)
 			}
 
 			x := <-network
 			fmt.Println("Adding ", newContrib, " from oracle ", oracles[x].Name)
-			fmt.Println("Total: ", total)
-			hardCap := oracles[x].HardCap //big.NewInt(100000000000000) //oracles[x].HardCap
+			fmt.Println("New total: ", total)
+			hardCap := oracles[x].HardCap
 			fmt.Println("HardCap on ", oracles[x].Name, ": ", total, "/", hardCap)
 			if total.Cmp(hardCap) > 0 {
 				for _, oracle := range oracles {

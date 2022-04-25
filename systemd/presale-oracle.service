@@ -1,0 +1,10 @@
+[Unit]
+Description=Presale Oracle
+
+[Service]
+WorkingDirectory=/opt
+ExecStart=/opt/presale-oracle config.json
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
